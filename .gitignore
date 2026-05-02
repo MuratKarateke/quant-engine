@@ -1,0 +1,112 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ⚠️ HASSAS BİLGİLER - GitHub'a YÜKLENMEYECEK
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 🔐 ORTAM DEĞİŞKENLERİ (Gerçek şifreler buradadır!)
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+
+# 💾 VERİTABANI (Kişisel veriler içerebilir)
+*.db
+*.sqlite
+*.sqlite3
+borsa_terminali.db
+
+# 🔍 IDE VE EDITÖR DOSYLARI
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# 🐍 PYTHON CACHE VE SANAL ORTAM
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 🔨 BUILD DOSYALARI
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# 🧪 TEST VE COVERAGE
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
+coverage.xml
+*.cover
+
+# 🔐 API ANAHTARLARI VE ŞİFRELER (Eğer başka dosyalarda varsa)
+.apikeys
+credentials.json
+secrets.json
+config/secrets/
+
+# 🌐 FLUTTER İÇİN ALAN YAZILMADI (çoğunlukla tracked)
+# Fakat build/ ve podfile.lock dışlamak isteyebilirsiniz
+# build/
+# pubspec.lock (genelde tracked kalır, ama isteyene göre değişir)
+
+# 📱 ANDROID Build ARTIFAKTLERI
+borsa_asistani/android/local.properties
+borsa_asistani/android/.gradle/
+borsa_asistani/android/build/
+
+# 🍎 iOS BUILD
+borsa_asistani/ios/Pods/
+borsa_asistani/ios/Podfile.lock
+
+# 📝 TEMP VE LOG DOSYLARI
+*.log
+*.logs
+logs/
+tmp/
+temp/
+*.tmp
+
+# 💻 İŞLETİM SİSTEMİ DOSYLARI
+Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 🎯 PROJEYİ ÖZGE DOSYALARI
+worker_debug.py
+test_*.py
+debug_*.py
+*.backup
+*.bak
