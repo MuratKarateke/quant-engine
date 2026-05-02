@@ -1,9 +1,8 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-sqlalchemy==2.0.23
-yfinance==0.2.32
-pandas==2.1.3
-pandas-ta==0.3.14b0
-numpy==1.24.3
-python-dotenv==1.0.0
-requests==2.31.0
+ta
+pandas
+numpy
+fastapi
+uvicorn
+yfinance
+python-dotenv
+sqlalchemy
