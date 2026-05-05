@@ -390,21 +390,7 @@ def canli_hisse_detayi(hisse_kodu: str, vade: str = "orta"):
             "puan_detay": puanDetay
         }
     except Exception as e: return {"hata": str(e)}
-    # === YENİ: SİNYAL GEÇMİŞİ VE KARNE ROTASI ===
-@app.get("/karne")
-def bot_karnesi(db: Session = Depends(get_db)):
-    # Geçmiş tüm fırsat sinyallerini en yeniden en eskiye doğru getirir
-    sinyaller = db.query(SinyalGecmisi).order_by(SinyalGecmisi.sinyal_tarihi.desc()).limit(50).all()
-    
-    return {"sonuclar": [
-        {
-            "hisse": s.hisse_kodu,
-            "tarih": s.sinyal_tarihi.strftime("%d/%m/%Y %H:%M"),
-            "giris": s.giris_fiyati,
-            "hedef": s.hedef_fiyat,
-            "stop": s.stop_fiyat,
-            "durum": s.durum,
-            "max_getiri_yuzdesi": s.max_getiri_yuzdesi,
-            "karar": s.karar
-        } for s in sinyaller
-    ]}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)

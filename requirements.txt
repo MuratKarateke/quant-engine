@@ -1,8 +1,9 @@
-ta
+pandas-ta
+yfinance
 pandas
 numpy
 fastapi
 uvicorn
-yfinance
-python-dotenv
 sqlalchemy
+python-dotenv
+requests

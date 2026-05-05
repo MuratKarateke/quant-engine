@@ -10,6 +10,25 @@ from database import SessionLocal, HisseAnaliz, SinyalGecmisi
 import requests
 import traceback
 
+# ═══ YAHOO RATE LIMIT BYPASS ═══
+# curl_cffi backend rate limit'e takilir, requests.Session ile degistirince sorun kalkiyor
+def _reset_yf_session():
+    """yfinance'in HTTP backend'ini curl_cffi'den requests'e cevir."""
+    try:
+        d = yf.data.YfData()
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        })
+        d._session = s
+        d._cookie = None
+        d._crumb = None
+        print("[INIT] yfinance session sifirlandi (requests backend)", flush=True)
+    except Exception as e:
+        print(f"[INIT] Session reset hatasi (onemli degil): {e}", flush=True)
+
+_reset_yf_session()
+
 # --- DİNAMİK BİST HİSSE LİSTESİ (Artık manuel ekleme yok!) ---
 # İş Yatırım'dan anlık güncel liste çekilecek.
 
@@ -41,12 +60,23 @@ GLOBAL_HISSELER = [
     "TYL", "TRMB"
 ]
 
+def _safe_float(val):
+    """Series veya scalar'dan guvenli float cevir."""
+    if isinstance(val, pd.Series):
+        return float(val.iloc[0]) if len(val) > 0 else 0.0
+    return float(val)
+
 def get_hisse_veri(df, symbol):
     if df is None or df.empty: return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         if symbol in df.columns.levels[0]:
             try:
-                return df[symbol].dropna(how='all')
+                result = df[symbol].dropna(how='all')
+                # Duplicate column temizligi
+                if isinstance(result.columns, pd.MultiIndex):
+                    result.columns = result.columns.get_level_values(-1)
+                result = result.loc[:, ~result.columns.duplicated()]
+                return result
             except: pass
     elif len(df.columns) > 0 and 'Close' in df.columns:
         return df.dropna(how='all')
@@ -61,7 +91,7 @@ def hisse_analiz_et_bulk(symbol, df_30m, df_1d):
         
         realtime_price = 0.0
         if not veri.empty and 'Close' in veri.columns:
-            realtime_price = float(veri['Close'].iloc[-1])
+            realtime_price = _safe_float(veri['Close'].iloc[-1])
             
         is_truly_young = False
         gercek_mum_sayisi = 0
@@ -75,7 +105,7 @@ def hisse_analiz_et_bulk(symbol, df_30m, df_1d):
             return {
                 "hisse_kodu": symbol.replace('.IS', ''),
                 "fiyat": round(realtime_price, 2), "rsi": 0.0, "puan": 0,
-                "karar": "YENİ ARZ ⏳", "risk_seviyesi": "BELİRSİZ",
+                "karar": "YENI ARZ", "risk_seviyesi": "BELİRSİZ",
                 "zarar_kes": 0.0, "kar_al": 0.0,
                 "genc_hisse": True, "borsa": borsa
             }
@@ -85,11 +115,11 @@ def hisse_analiz_et_bulk(symbol, df_30m, df_1d):
             veri = veri[veri['Volume'] > 0]
         
         if gercek_mum_sayisi < 20:
-            son_fiyat = round(float(veri['Close'].iloc[-1]), 2) if len(veri) > 0 else 0.0
+            son_fiyat = round(_safe_float(veri['Close'].iloc[-1]), 2) if len(veri) > 0 else 0.0
             return {
                 "hisse_kodu": symbol.replace('.IS', ''),
                 "fiyat": son_fiyat, "rsi": 0.0, "puan": 0,
-                "karar": "YENİ ARZ ⏳", "risk_seviyesi": "BELİRSİZ",
+                "karar": "YENI ARZ", "risk_seviyesi": "BELİRSİZ",
                 "zarar_kes": 0.0, "kar_al": 0.0,
                 "tp1": 0.0, "tp2": 0.0, "initial_stop": 0.0,
                 "genc_hisse": True, "borsa": borsa
@@ -124,15 +154,15 @@ def hisse_analiz_et_bulk(symbol, df_30m, df_1d):
         if ta_data.empty: return None
 
         son_gun = ta_data.iloc[-1]
-        close_val = float(son_gun['Close'])
-        rsi_val = float(son_gun.get('RSI_14', 50))
+        close_val = _safe_float(son_gun['Close'])
+        rsi_val = _safe_float(son_gun.get('RSI_14', 50))
         
         # ─── SNIPER GATE DEĞERLERI ───
         chop_col = next((c for c in ta_data.columns if c.startswith("CHOP_")), None)
         cmf_col  = next((c for c in ta_data.columns if c.startswith("CMF_")),  None)
         
-        chop_val = float(son_gun[chop_col]) if chop_col and pd.notna(son_gun[chop_col]) else 60.0  # Yoksa default choppy
-        cmf_val  = float(son_gun[cmf_col])  if cmf_col  and pd.notna(son_gun[cmf_col])  else 0.0
+        chop_val = _safe_float(son_gun[chop_col]) if chop_col and pd.notna(son_gun[chop_col]) else 60.0  # Yoksa default choppy
+        cmf_val  = _safe_float(son_gun[cmf_col])  if cmf_col  and pd.notna(son_gun[cmf_col])  else 0.0
         
         is_trending    = chop_val < 50       # Module A: Piyasa trend halinde mi?
         has_inst_flow  = cmf_val  > 0.05     # Module B: Kurumsal para girişi var mı?
@@ -183,14 +213,14 @@ def hisse_analiz_et_bulk(symbol, df_30m, df_1d):
         #  Squeeze (Engine 2) + CHOP (Regime) + CMF (Flow)
         # ════════════════════════════════════════════════════════
         if firsat_puani >= 15 and toplam_puan >= 65 and is_trending and has_inst_flow:
-            karar = "🚀 POTANSİYEL PATLAMA"
+            karar = "POTANSIYEL PATLAMA"
         elif toplam_puan >= 60 and cmf_val > 0.0:  # 'AL' de CMF pozitif olsun
             karar = "AL"
         elif toplam_puan <= 30: karar = "SAT"
         else: karar = "BEKLE"
 
         atr_col = next((c for c in ta_data.columns if "ATRr_14" in c), None)
-        current_atr = float(son_gun[atr_col]) if atr_col and pd.notna(son_gun[atr_col]) else float(close_val * 0.02)
+        current_atr = _safe_float(son_gun[atr_col]) if atr_col and pd.notna(son_gun[atr_col]) else float(close_val * 0.02)
         
         # Dinamik ATR Bazlı Kâr/Zarar Seviyeleri (Profit Maximizer)
         tp1 = round(close_val + (current_atr * 1.5), 2)
@@ -326,7 +356,7 @@ def genc_hisse_analiz_et(symbol, veri, borsa="BIST", realtime_price=0.0):
         ta_data = _hesapla_ath_proximity(ta_data)
 
         son = ta_data.iloc[-1]
-        close_val = float(son['Close'])
+        close_val = _safe_float(son['Close'])
         toplam_puan = 0
 
         # ── SÜTUN 1: STEALTH VOLUME (maks 30) ──
@@ -357,7 +387,7 @@ def genc_hisse_analiz_et(symbol, veri, borsa="BIST", realtime_price=0.0):
         rsi_col = next((c for c in ta_data.columns if 'RSI_' in c), None)
         rsi_val = 50.0
         if rsi_col and pd.notna(ta_data[rsi_col].iloc[-1]):
-            rsi_val = float(ta_data[rsi_col].iloc[-1])
+            rsi_val = _safe_float(ta_data[rsi_col].iloc[-1])
             if rsi_val < 40: momentum_puan += 10
             elif 40 <= rsi_val <= 60: momentum_puan += 5
             elif rsi_val > 70: momentum_puan -= 5
@@ -396,13 +426,13 @@ def genc_hisse_analiz_et(symbol, veri, borsa="BIST", realtime_price=0.0):
             ta_data.ta.cmf(length=min(14, max(5, len(ta_data)-1)), append=True)
             cmf_col = next((c for c in ta_data.columns if c.startswith("CMF_")), None)
             if cmf_col and pd.notna(ta_data[cmf_col].iloc[-1]):
-                cmf_val = float(ta_data[cmf_col].iloc[-1])
+                cmf_val = _safe_float(ta_data[cmf_col].iloc[-1])
         except: pass
 
         has_inst_flow = cmf_val > 0.03
 
         if toplam_puan >= 72 and has_inst_flow:
-            karar = "\U0001f680 POTANSİYEL PATLAMA"
+            karar = "POTANSIYEL PATLAMA"
         elif toplam_puan >= 55 and cmf_val > 0.0: karar = "AL"
         elif toplam_puan <= 25: karar = "SAT"
         else: karar = "BEKLE"
@@ -439,33 +469,88 @@ def guncel_bist_hisseleri_getir():
             # BIST'te şu an ~550-650 arası hisse var. 
             # 40'tan fazla hisse bulduysa başarılı sayalım (limitleri esnettik)
             if len(hisseler) >= 40:
-                print(f"[OK] BIST listesi cekildi: {len(hisseler)} hisse")
+                print(f"[OK] BIST listesi cekildi: {len(hisseler)} hisse", flush=True)
                 return hisseler
     except Exception as e:
-        print(f"BIST listesi çekilirken hata: {e}")
+        print(f"[HATA] BIST listesi cekilirken hata: {e}", flush=True)
 
     # Fallback listesi (Eğer site çökerse)
-    print("⚠️ Dinamik liste çekilemedi, eski fallback listesi kullanılıyor.")
+    print("[!] Dinamik liste cekilemedi, eski fallback listesi kullaniliyor.", flush=True)
     return ["THYAO.IS", "EREGL.IS", "TUPRS.IS", "GARAN.IS", "AKBNK.IS", "YKBNK.IS", "ISCTR.IS", "SAHOL.IS", "KCHOL.IS", "BIMAS.IS"]
+
+def batch_download(tickers, period, interval, batch_size=100):
+    """Hisseleri batch'ler halinde hizli bulk indirme."""
+    all_dfs = []
+    toplam_batch = (len(tickers) - 1) // batch_size + 1
+    
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i+batch_size]
+        batch_no = i // batch_size + 1
+        
+        basarili = False
+        for deneme in range(3):
+            try:
+                df = yf.download(batch, period=period, interval=interval, group_by="ticker", threads=True, progress=False)
+                
+                if df is not None and not df.empty:
+                    if not isinstance(df.columns, pd.MultiIndex) and len(batch) == 1:
+                        df.columns = pd.MultiIndex.from_product([[batch[0]], df.columns], names=['Ticker', 'Price'])
+                    all_dfs.append(df)
+                    basarili = True
+                    break
+                else:
+                    _reset_yf_session()
+                    time.sleep(2)
+            except Exception as e:
+                err = str(e)
+                if "Rate" in err or "429" in err:
+                    print(f"  [RATE] Batch {batch_no} - session resetleniyor (deneme {deneme+1}/3)...", flush=True)
+                    _reset_yf_session()
+                    time.sleep(3)
+                else:
+                    print(f"  [HATA] Batch {batch_no}: {e}", flush=True)
+                    break
+        
+        durum = "OK" if basarili else "BOS"
+        print(f"  Batch {batch_no}/{toplam_batch} [{durum}]", flush=True)
+    
+    if not all_dfs:
+        return pd.DataFrame()
+    if len(all_dfs) == 1:
+        return all_dfs[0]
+    return pd.concat(all_dfs, axis=1)
+
 
 def taramayi_baslat():
     db = SessionLocal()
+    dongu_sayisi = 0
     while True:
+        dongu_sayisi += 1
+        
+        # Her dongude session'i sifirla (rate limit onlemi)
+        _reset_yf_session()
+        
         BIST_DINAMIK = guncel_bist_hisseleri_getir()
         TUM_HISSELER = list(set(BIST_DINAMIK + GLOBAL_HISSELER))
         toplam = len(TUM_HISSELER)
-        print(f"\n[SCAN] {toplam} HISSELIK BULK TARAMA BASLIYOR...")
+        print(f"\n[SCAN #{dongu_sayisi}] {toplam} HISSELIK TARAMA BASLIYOR...")
         
         baslangic = time.time()
         
-        print("[-] 30 Dakikalik veriler indiriliyor...")
-        df_30m = yf.download(TUM_HISSELER, period="1mo", interval="30m", group_by="ticker", threads=True, progress=False)
-        print("[-] Gunluk veriler indiriliyor...")
-        df_1d = yf.download(TUM_HISSELER, period="1y", interval="1d", group_by="ticker", threads=True, progress=False)
+        # 30m ve 1d verileri PARALEL indir (sure yariya iner)
+        print("[-] 30m + 1d veriler PARALEL indiriliyor...", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as dl_executor:
+            f_30m = dl_executor.submit(batch_download, TUM_HISSELER, "1mo", "30m")
+            f_1d  = dl_executor.submit(batch_download, TUM_HISSELER, "1y", "1d")
+            df_30m = f_30m.result()
+            df_1d  = f_1d.result()
+        
+        indirme_suresi = time.time() - baslangic
+        print(f"[-] Indirme tamamlandi: {indirme_suresi:.1f} sn", flush=True)
         
         gecerli_sonuclar = []
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
             future_to_symbol = {executor.submit(hisse_analiz_et_bulk, symbol, df_30m, df_1d): symbol for symbol in TUM_HISSELER}
             tamamlanan = 0
             for future in concurrent.futures.as_completed(future_to_symbol):
@@ -535,7 +620,7 @@ def taramayi_baslat():
                         aktif_sinyal.kapanis_tarihi = datetime.utcnow()
             
             # Yeni bir Roket Sinyali geldiyse (eğer zaten o hissede aktif 🚀 yoksa)
-            if "🚀" in sonuc["karar"]:
+            if "POTANSIYEL PATLAMA" in sonuc["karar"]:
                 zaten_aktif_var = [s for s in aktif_sinyaller if s.durum in ["ACTIVE", "TP1_HIT_RISK_FREE"]]
                 if not zaten_aktif_var:
                     yeni_sinyal = SinyalGecmisi(
