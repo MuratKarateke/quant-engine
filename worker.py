@@ -90,7 +90,7 @@ def get_hisse_veri(df, symbol):
     return pd.DataFrame()
 
 
-def safe_fetch(ticker, period, interval, timeout=4):
+def safe_fetch(ticker, period, interval, timeout=10):
     """Tek bir ticker icin guvenli yf.Ticker().history() cagrisi.
     Herhangi bir hata durumunda None dondurur; hic bir zaman yf.download() kullanmaz.
     """
@@ -131,7 +131,7 @@ def parallel_fetch_all(tickers, period, interval, db):
     fetch_results = {}
     score_updates = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_ticker = {executor.submit(safe_fetch, ticker, period, interval): ticker for ticker in secilen}
         tamamlanan = 0
         toplam = len(secilen)
@@ -139,7 +139,7 @@ def parallel_fetch_all(tickers, period, interval, db):
             ticker = future_to_ticker[future]
             tamamlanan += 1
             try:
-                df = future.result(timeout=5)
+                df = future.result(timeout=10)
             except Exception:
                 df = None
 
