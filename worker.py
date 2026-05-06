@@ -4,30 +4,47 @@ import pandas as pd
 import numpy as np
 import time
 import concurrent.futures
+import threading
 from datetime import datetime
 from database import SessionLocal, HisseAnaliz, SinyalGecmisi
 
 import requests
 import traceback
+import warnings
+import logging
+
+# yfinance "possibly delisted" gibi INFO uyarilarini sustur (hata degil, gurultu)
+logging.getLogger("yfinance").setLevel(logging.ERROR)
+# pandas_ta CHOP indikatöründen gelen "divide by zero" RuntimeWarning'leri sustur
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # ═══ YAHOO RATE LIMIT BYPASS ═══
 # curl_cffi backend rate limit'e takilir, requests.Session ile degistirince sorun kalkiyor
 def _reset_yf_session():
-    """yfinance'in HTTP backend'ini curl_cffi'den requests'e cevir."""
-    try:
-        d = yf.data.YfData()
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        })
-        d._session = s
-        d._cookie = None
-        d._crumb = None
-        print("[INIT] yfinance session sifirlandi (requests backend)", flush=True)
-    except Exception as e:
-        print(f"[INIT] Session reset hatasi (onemli degil): {e}", flush=True)
+    """yfinance 1.2.0+ kendi curl_cffi session'ini yonetiyor.
+    Eski requests.Session inject yaklasimiyla uyumsuz — bu fonksiyon artik no-op.
+    """
+    print("[INIT] yfinance 1.2.0+ — session otomatik yonetiliyor.", flush=True)
 
 _reset_yf_session()
+
+# ═══ THREAD-LOCAL SESSION POOL ═══
+# Her worker thread'i kendi izole Session'ini bir kez olusturur ve
+# o thread icindeki TUM ticker'lar icin yeniden kullanir.
+# Bu sayede: (1) cookie race-condition yok, (2) crumb 1 kez alinir.
+_thread_local = threading.local()
+
+def _get_thread_session():
+    """Cagiran thread'e ozgu requests.Session dondurur (ilk cagride olusturur)."""
+    if not hasattr(_thread_local, 'session'):
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/125.0.0.0 Safari/537.36"
+        })
+        _thread_local.session = s
+    return _thread_local.session
 
 # --- DİNAMİK BİST HİSSE LİSTESİ (Artık manuel ekleme yok!) ---
 # İş Yatırım'dan anlık güncel liste çekilecek.
@@ -90,24 +107,36 @@ def get_hisse_veri(df, symbol):
     return pd.DataFrame()
 
 
+# yfinance 1.2.0+ crumb initialization lock:
+# Paralel thread'ler ayni anda crumb almaya calisirsa race condition olusur.
+# Lock ile ilk fetch siraya konur; sonraki thread'ler hazir crumb'u kullanir.
+_yf_crumb_lock = threading.Lock()
+_yf_crumb_initialized = False
+
+def _ensure_crumb():
+    """yfinance global crumb'unu tek bir thread'de once initialize eder."""
+    global _yf_crumb_initialized
+    if _yf_crumb_initialized:
+        return
+    with _yf_crumb_lock:
+        if not _yf_crumb_initialized:
+            try:
+                # Crumb almak icin sessiz bir test cekim yap
+                yf.Ticker("AAPL").history(period="1d", interval="1d", timeout=15)
+            except Exception:
+                pass
+            _yf_crumb_initialized = True
+
 def safe_fetch(ticker, period, interval, timeout=10):
     """Tek bir ticker icin guvenli yf.Ticker().history() cagrisi.
 
-    Her cagri KENDI izole requests.Session'ini olusturur.
-    Bu sayede paralel thread'ler ortak cookie jar'i paylasmazlar
-    (yfinance multithreading cookie race-condition fix).
-    Herhangi bir hata durumunda None dondurur; hic bir zaman yf.download() kullanmaz.
+    yfinance 1.2.0+: session= parametresi desteklenmiyor (curl_cffi zorunlu).
+    Crumb race-condition'i _yf_crumb_lock ile onlenir.
+    Herhangi bir hata durumunda None dondurur.
     """
+    _ensure_crumb()
     try:
-        # Thread'e ozel izole HTTP session — kendi CookieJar'i var
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/125.0.0.0 Safari/537.36"
-        })
-        ticker_obj = yf.Ticker(ticker, session=session)
-        df = ticker_obj.history(period=period, interval=interval, timeout=timeout)
+        df = yf.Ticker(ticker).history(period=period, interval=interval, timeout=timeout)
         if df is None or df.empty:
             return None
         return df
@@ -122,18 +151,15 @@ def parallel_fetch_all(tickers, period, interval, db):
         fetch_results : dict {ticker: DataFrame or None}
         score_updates : dict {ticker: int}  (+1 basarili, -2 basarisiz)
     """
-    # Sadece DB'de is_active=True olan ticker'lari cek
-    aktif_kayitlar = db.query(HisseAnaliz.hisse_kodu).filter(HisseAnaliz.is_active == True).all()
-    aktif_kodlar = set(r.hisse_kodu for r in aktif_kayitlar)
+    # Sadece açıkça karantinaya alınmış (is_active=False) ticker'ları atla.
+    # DB'de kaydı olmayan yeni ticker'lar her zaman çekilir.
+    inaktif_kayitlar = db.query(HisseAnaliz.hisse_kodu).filter(HisseAnaliz.is_active == False).all()
+    inaktif_kodlar = set(r.hisse_kodu for r in inaktif_kayitlar)
 
-    # BIST hisseleri .IS uzantisiyla gelir; DB'de uzantisiz saklanabilir
-    # Her iki forme de bak: THYAO.IS -> THYAO, AAPL -> AAPL
     def _is_aktif(ticker):
         kod = ticker.replace('.IS', '')
-        # Eger hic kayit yoksa (yeni hisse) aktif kabul et
-        if not aktif_kodlar:
-            return True
-        return kod in aktif_kodlar or ticker in aktif_kodlar
+        # Sadece açıkça karantinaya alınanları atla, geri kalan herkes geçer
+        return kod not in inaktif_kodlar and ticker not in inaktif_kodlar
 
     secilen = [t for t in tickers if _is_aktif(t)]
     atlanan = len(tickers) - len(secilen)
@@ -574,8 +600,10 @@ def taramayi_baslat():
     while True:
         dongu_sayisi += 1
         
-        # Her dongude session'i sifirla (rate limit onlemi)
-        _reset_yf_session()
+        # yfinance 1.2.0+ kendi session'ini yonetiyor — _reset_yf_session cagrilmaz.
+        # Her dongu basi crumb'un yenilenmesi icin flag'i sifirla.
+        global _yf_crumb_initialized
+        _yf_crumb_initialized = False
         
         BIST_DINAMIK = guncel_bist_hisseleri_getir()
         TUM_HISSELER = list(set(BIST_DINAMIK + GLOBAL_HISSELER))
@@ -594,7 +622,9 @@ def taramayi_baslat():
 
         # ── HEALTH SCORE GÜNCELLEMESİ (ana thread, DB yazısı burada) ──
         print("[-] Health score guncelleniyor...", flush=True)
-        for ticker in TUM_HISSELER:
+        # Sadece gercekten fetch edilen ticker'lara skor guncelle (skip edilenlere dokunma)
+        fetch_edilen = set(scores_30m.keys()) | set(scores_1d.keys())
+        for ticker in fetch_edilen:
             delta_30m = scores_30m.get(ticker, 0)
             delta_1d  = scores_1d.get(ticker, 0)
             net_delta = delta_30m + delta_1d  # min -4, max +2
