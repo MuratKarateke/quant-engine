@@ -26,8 +26,14 @@ class HisseAnaliz(Base):
     risk_seviyesi = Column(String)
     zarar_kes = Column(Float)
     kar_al = Column(Float)
+    tp1 = Column(Float, nullable=True)
+    tp2 = Column(Float, nullable=True)
+    initial_stop = Column(Float, nullable=True)
     genc_hisse = Column(Boolean, default=False)
     borsa = Column(String, default="BIST")
+    # Health tracking — worker tarafindan yuklenen veri kalitesini izler
+    is_active = Column(Boolean, default=True)
+    health_score = Column(Integer, default=0)
 
 class Portfoy(Base):
     __tablename__ = "portfoy"

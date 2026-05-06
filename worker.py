@@ -67,7 +67,14 @@ def _safe_float(val):
     return float(val)
 
 def get_hisse_veri(df, symbol):
-    if df is None or df.empty: return pd.DataFrame()
+    # ── Dict path (parallel_fetch_all sonucu) ──
+    if isinstance(df, dict):
+        result = df.get(symbol)
+        if result is None or (isinstance(result, pd.DataFrame) and result.empty):
+            return pd.DataFrame()
+        return result
+    # ── MultiIndex DataFrame path (eski bulk download uyumu) ──
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty): return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         if symbol in df.columns.levels[0]:
             try:
@@ -78,9 +85,77 @@ def get_hisse_veri(df, symbol):
                 result = result.loc[:, ~result.columns.duplicated()]
                 return result
             except: pass
-    elif len(df.columns) > 0 and 'Close' in df.columns:
+    elif isinstance(df, pd.DataFrame) and len(df.columns) > 0 and 'Close' in df.columns:
         return df.dropna(how='all')
     return pd.DataFrame()
+
+
+def safe_fetch(ticker, period, interval, timeout=4):
+    """Tek bir ticker icin guvenli yf.Ticker().history() cagrisi.
+    Herhangi bir hata durumunda None dondurur; hic bir zaman yf.download() kullanmaz.
+    """
+    try:
+        df = yf.Ticker(ticker).history(period=period, interval=interval, timeout=timeout)
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def parallel_fetch_all(tickers, period, interval, db):
+    """Aktif ticker'lari ThreadPoolExecutor ile paralel ceker.
+
+    Returns:
+        fetch_results : dict {ticker: DataFrame or None}
+        score_updates : dict {ticker: int}  (+1 basarili, -2 basarisiz)
+    """
+    # Sadece DB'de is_active=True olan ticker'lari cek
+    aktif_kayitlar = db.query(HisseAnaliz.hisse_kodu).filter(HisseAnaliz.is_active == True).all()
+    aktif_kodlar = set(r.hisse_kodu for r in aktif_kayitlar)
+
+    # BIST hisseleri .IS uzantisiyla gelir; DB'de uzantisiz saklanabilir
+    # Her iki forme de bak: THYAO.IS -> THYAO, AAPL -> AAPL
+    def _is_aktif(ticker):
+        kod = ticker.replace('.IS', '')
+        # Eger hic kayit yoksa (yeni hisse) aktif kabul et
+        if not aktif_kodlar:
+            return True
+        return kod in aktif_kodlar or ticker in aktif_kodlar
+
+    secilen = [t for t in tickers if _is_aktif(t)]
+    atlanan = len(tickers) - len(secilen)
+    if atlanan:
+        print(f"  [SKIP] {atlanan} inaktif ticker atlanıyor ({interval})", flush=True)
+
+    fetch_results = {}
+    score_updates = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        future_to_ticker = {executor.submit(safe_fetch, ticker, period, interval): ticker for ticker in secilen}
+        tamamlanan = 0
+        toplam = len(secilen)
+        for future in concurrent.futures.as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            tamamlanan += 1
+            try:
+                df = future.result(timeout=5)
+            except Exception:
+                df = None
+
+            fetch_results[ticker] = df
+            score_updates[ticker] = +1 if (df is not None and not df.empty) else -2
+
+            yuzde = (tamamlanan / toplam) * 100 if toplam else 100
+            print(f"  [FETCH {interval}] %{yuzde:.1f} ({tamamlanan}/{toplam})", end="\r", flush=True)
+
+    # Atilan (inaktif) ticker'lara da fetch_results girisi ekle (None)
+    for ticker in tickers:
+        if ticker not in fetch_results:
+            fetch_results[ticker] = None
+
+    print(f"\n  [FETCH {interval}] Tamamlandi: {len(secilen)} istek gonderildi.", flush=True)
+    return fetch_results, score_updates
 
 def hisse_analiz_et_bulk(symbol, df_30m, df_1d):
     try:
@@ -478,47 +553,7 @@ def guncel_bist_hisseleri_getir():
     print("[!] Dinamik liste cekilemedi, eski fallback listesi kullaniliyor.", flush=True)
     return ["THYAO.IS", "EREGL.IS", "TUPRS.IS", "GARAN.IS", "AKBNK.IS", "YKBNK.IS", "ISCTR.IS", "SAHOL.IS", "KCHOL.IS", "BIMAS.IS"]
 
-def batch_download(tickers, period, interval, batch_size=100):
-    """Hisseleri batch'ler halinde hizli bulk indirme."""
-    all_dfs = []
-    toplam_batch = (len(tickers) - 1) // batch_size + 1
-    
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i+batch_size]
-        batch_no = i // batch_size + 1
-        
-        basarili = False
-        for deneme in range(3):
-            try:
-                df = yf.download(batch, period=period, interval=interval, group_by="ticker", threads=True, progress=False)
-                
-                if df is not None and not df.empty:
-                    if not isinstance(df.columns, pd.MultiIndex) and len(batch) == 1:
-                        df.columns = pd.MultiIndex.from_product([[batch[0]], df.columns], names=['Ticker', 'Price'])
-                    all_dfs.append(df)
-                    basarili = True
-                    break
-                else:
-                    _reset_yf_session()
-                    time.sleep(2)
-            except Exception as e:
-                err = str(e)
-                if "Rate" in err or "429" in err:
-                    print(f"  [RATE] Batch {batch_no} - session resetleniyor (deneme {deneme+1}/3)...", flush=True)
-                    _reset_yf_session()
-                    time.sleep(3)
-                else:
-                    print(f"  [HATA] Batch {batch_no}: {e}", flush=True)
-                    break
-        
-        durum = "OK" if basarili else "BOS"
-        print(f"  Batch {batch_no}/{toplam_batch} [{durum}]", flush=True)
-    
-    if not all_dfs:
-        return pd.DataFrame()
-    if len(all_dfs) == 1:
-        return all_dfs[0]
-    return pd.concat(all_dfs, axis=1)
+
 
 
 def taramayi_baslat():
@@ -537,27 +572,48 @@ def taramayi_baslat():
         
         baslangic = time.time()
         
-        # 30m ve 1d verileri PARALEL indir (sure yariya iner)
-        print("[-] 30m + 1d veriler PARALEL indiriliyor...", flush=True)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as dl_executor:
-            f_30m = dl_executor.submit(batch_download, TUM_HISSELER, "1mo", "30m")
-            f_1d  = dl_executor.submit(batch_download, TUM_HISSELER, "1y", "1d")
-            df_30m = f_30m.result()
-            df_1d  = f_1d.result()
-        
+        # 30m ve 1d verileri paralel cek (her ticker icin ayri safe_fetch)
+        print("[-] 30m + 1d veriler paralel cekiliyor...", flush=True)
+        fetch_30m, scores_30m = parallel_fetch_all(TUM_HISSELER, "1mo", "30m", db)
+        fetch_1d,  scores_1d  = parallel_fetch_all(TUM_HISSELER, "1y",  "1d",  db)
+
         indirme_suresi = time.time() - baslangic
         print(f"[-] Indirme tamamlandi: {indirme_suresi:.1f} sn", flush=True)
-        
+
+        # ── HEALTH SCORE GÜNCELLEMESİ (ana thread, DB yazısı burada) ──
+        print("[-] Health score guncelleniyor...", flush=True)
+        for ticker in TUM_HISSELER:
+            delta_30m = scores_30m.get(ticker, 0)
+            delta_1d  = scores_1d.get(ticker, 0)
+            net_delta = delta_30m + delta_1d  # min -4, max +2
+
+            kod = ticker.replace('.IS', '')
+            kayit = db.query(HisseAnaliz).filter(HisseAnaliz.hisse_kodu == kod).first()
+            if kayit is None:
+                # Henuz DB'de yoksa health score guncellemeye gerek yok
+                continue
+
+            eski_skor = kayit.health_score if kayit.health_score is not None else 0
+            yeni_skor = max(-10, min(5, eski_skor + net_delta))
+            kayit.health_score = yeni_skor
+
+            if yeni_skor < -5 and kayit.is_active:
+                kayit.is_active = False
+                print(f"[QUARANTINE] {ticker} score dropped to {yeni_skor}. Marking as inactive.", flush=True)
+
+        db.commit()
+        print("[-] Health score commit tamamlandi.", flush=True)
+
         gecerli_sonuclar = []
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
-            future_to_symbol = {executor.submit(hisse_analiz_et_bulk, symbol, df_30m, df_1d): symbol for symbol in TUM_HISSELER}
+            future_to_symbol = {executor.submit(hisse_analiz_et_bulk, symbol, fetch_30m, fetch_1d): symbol for symbol in TUM_HISSELER}
             tamamlanan = 0
             for future in concurrent.futures.as_completed(future_to_symbol):
                 tamamlanan += 1
                 sonuc = future.result()
                 if sonuc: gecerli_sonuclar.append(sonuc)
-                
+
                 yuzde = (tamamlanan / toplam) * 100
                 print(f"[PROG] Analiz: %{yuzde:.1f} ({tamamlanan}/{toplam})", end="\r")
 
