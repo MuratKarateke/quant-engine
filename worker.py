@@ -92,10 +92,22 @@ def get_hisse_veri(df, symbol):
 
 def safe_fetch(ticker, period, interval, timeout=10):
     """Tek bir ticker icin guvenli yf.Ticker().history() cagrisi.
+
+    Her cagri KENDI izole requests.Session'ini olusturur.
+    Bu sayede paralel thread'ler ortak cookie jar'i paylasmazlar
+    (yfinance multithreading cookie race-condition fix).
     Herhangi bir hata durumunda None dondurur; hic bir zaman yf.download() kullanmaz.
     """
     try:
-        df = yf.Ticker(ticker).history(period=period, interval=interval, timeout=timeout)
+        # Thread'e ozel izole HTTP session — kendi CookieJar'i var
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/125.0.0.0 Safari/537.36"
+        })
+        ticker_obj = yf.Ticker(ticker, session=session)
+        df = ticker_obj.history(period=period, interval=interval, timeout=timeout)
         if df is None or df.empty:
             return None
         return df
